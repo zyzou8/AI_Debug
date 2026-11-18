@@ -1,0 +1,4 @@
+{
+  "apiBase": "https://desired-tables-resolved-fairly.trycloudflare.com",
+  "note": "Written by server/run_tutor_stack.sh. A cloudflared quick tunnel changes hostname on every restart, so this file is the single place the address lives."
+}
