@@ -87,6 +87,20 @@ Request bounds that are enforced: 12,000-char prompt cap, 500-token reply cap,
 
 ## Pedagogy
 
+It is a **live, multi-turn tutor**: the page keeps the whole transcript per panel
+(`convo`) and resends it with every request, so the student can answer the tutor's
+question and keep going. "Send reply" (Ctrl+Enter) continues the conversation;
+"Start over" clears it, as does switching tasks.
+
+The rules go in a **`system` message**, not mixed into the student's turn. That
+distinction matters: with the rules in the user turn the model treats them as
+negotiable context and hands over the corrected line as soon as a student says
+"just tell me the answer". In the system role it holds the line and keeps asking.
+
+The student's code travels with the opening message. If they edit the code mid
+conversation, the next turn appends the updated version ("I changed my code, here
+it is now"), so the tutor is never reasoning about a stale copy.
+
 The prompt rules live in `index.html` (`TUTOR_RULES`, `HINT_RULES`, `QA_RULES`). The
 tutor is instructed never to give the corrected code or line, to cover one step at a
 time, and to end every reply with exactly one question. The hint ladder (think it

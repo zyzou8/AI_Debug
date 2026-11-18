@@ -43,6 +43,12 @@ MAX_PROMPT_CHARS = int(os.environ.get("TUTOR_MAX_PROMPT_CHARS", "12000"))
 MAX_TOKENS = int(os.environ.get("TUTOR_MAX_TOKENS", "500"))
 UPSTREAM_TIMEOUT = float(os.environ.get("TUTOR_TIMEOUT", "120"))
 
+# A tutoring session is multi-turn, so the whole transcript is resent each time.
+# Trim it rather than reject it: a student deep in a conversation should never
+# hit a wall. 60k chars is roughly 15k tokens, half the 32k context.
+MAX_CONVO_CHARS = int(os.environ.get("TUTOR_MAX_CONVO_CHARS", "60000"))
+MAX_TURNS = int(os.environ.get("TUTOR_MAX_TURNS", "40"))
+
 app = FastAPI(title="AI 100 Tutor proxy", docs_url=None, redoc_url=None)
 
 app.add_middleware(
@@ -109,19 +115,11 @@ async def tutor(request: Request, origin: str | None = Header(default=None)):
     except Exception:
         raise HTTPException(status_code=400, detail="body must be JSON")
 
-    prompt = (body.get("prompt") or "").strip()
-    if not prompt:
-        raise HTTPException(status_code=400, detail="missing 'prompt'")
-    if len(prompt) > MAX_PROMPT_CHARS:
-        raise HTTPException(
-            status_code=413,
-            detail=f"prompt too long ({len(prompt)} chars, max {MAX_PROMPT_CHARS})",
-        )
-
+    messages = _build_messages(body)
     stream = bool(body.get("stream", True))
     payload = {
         "model": MODEL,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": messages,
         # Low but not greedy: the tutor should vary its phrasing across hint
         # levels without drifting off the "never give the fix" rules.
         "temperature": float(body.get("temperature", 0.3)),
@@ -176,6 +174,55 @@ async def tutor(request: Request, origin: str | None = Header(default=None)):
             "X-Accel-Buffering": "no",
         },
     )
+
+
+def _build_messages(body: dict) -> list[dict]:
+    """Turn the page's payload into a chat transcript for vLLM.
+
+    The tutoring rules belong in a `system` message: with them buried in the
+    user turn the model treats them as discussable context and will hand over
+    the corrected line when a student pushes for it.
+    """
+    system = (body.get("system") or "").strip()
+
+    raw = body.get("messages")
+    if raw is None:  # single-shot callers (curl, the old page)
+        prompt = (body.get("prompt") or "").strip()
+        if not prompt:
+            raise HTTPException(status_code=400, detail="missing 'messages' or 'prompt'")
+        raw = [{"role": "user", "content": prompt}]
+    if not isinstance(raw, list) or not raw:
+        raise HTTPException(status_code=400, detail="'messages' must be a non-empty list")
+
+    turns: list[dict] = []
+    for m in raw[-MAX_TURNS:]:
+        if not isinstance(m, dict):
+            continue
+        role, content = m.get("role"), (m.get("content") or "").strip()
+        if role not in ("user", "assistant") or not content:
+            continue
+        if len(content) > MAX_PROMPT_CHARS:
+            raise HTTPException(
+                status_code=413,
+                detail=f"message too long ({len(content)} chars, max {MAX_PROMPT_CHARS})",
+            )
+        turns.append({"role": role, "content": content})
+
+    if not turns:
+        raise HTTPException(status_code=400, detail="no usable messages")
+    if turns[-1]["role"] != "user":
+        raise HTTPException(status_code=400, detail="the last message must be the student's")
+
+    # Trim oldest-first when the transcript outgrows the budget, but never drop
+    # turns[0]: that is the one carrying the assignment and the student's code,
+    # so losing it is exactly the "tutor can't see my code" failure.
+    def total() -> int:
+        return len(system) + sum(len(t["content"]) for t in turns)
+
+    while total() > MAX_CONVO_CHARS and len(turns) > 2:
+        turns.pop(1)
+
+    return ([{"role": "system", "content": system}] if system else []) + turns
 
 
 def _sse(obj: dict) -> str:

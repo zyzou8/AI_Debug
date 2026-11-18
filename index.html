@@ -112,6 +112,14 @@
     <h2 id="chat-h">AI tutor</h2>
     <div id="log" aria-live="polite"><p class="empty">Ask a question and the tutor's reply shows up here.</p></div>
 
+    <label for="reply">Your reply to the tutor</label>
+    <textarea id="reply" rows="2" placeholder="Answer the tutor's question in your own words…" disabled></textarea>
+    <p class="hint">The tutor remembers this conversation, so you can keep going back and forth. Press Ctrl+Enter to send.</p>
+    <div class="actions">
+      <button class="primary" id="reply-send" disabled>Send reply</button>
+      <button class="secondary" id="reset">Start over</button>
+    </div>
+
     <label>How hard was this task?</label>
     <div class="rating" id="rating" role="group" aria-label="Difficulty from 1 easy to 5 very hard">
       <button>1</button><button>2</button><button>3</button><button>4</button><button>5</button>
@@ -267,6 +275,21 @@ async function copyText(text) {
 let level = 1, maxUnlocked = 1, difficulty = null;
 const events = []; // 研究日志：正式版发到你的后端
 
+// ---- 对话状态 ----
+// tutor 要能接着上一句往下说，所以整段 transcript 都留着，每次连 system 一起发。
+// 在这里声明（而不是用到的地方）是因为 loadTask() 开场就会清空它。
+const convo = { "log": [], "qa-log": [] };
+let lastSentCode = null;
+
+function resetTaskChat() {
+  convo["log"] = [];
+  lastSentCode = null;
+  $("log").innerHTML = '<p class="empty">Ask a question and the tutor\'s reply shows up here.</p>';
+  $("reply").value = "";
+  $("reply").disabled = true;
+  $("reply-send").disabled = true;
+}
+
 // ---- task 选择 ----
 TASKS.forEach((t, i) => $("task").add(new Option(t.title, i)));
 function loadTask() {
@@ -275,6 +298,8 @@ function loadTask() {
   $("code").value = t.code;
   ["expect", "got", "guess", "q"].forEach((id) => ($(id).value = ""));
   level = 1; maxUnlocked = 1; renderLadder();
+  // 换题就从头开始：留着上一题的对话只会让 tutor 拿旧代码回答新题
+  resetTaskChat();
 }
 $("task").addEventListener("change", loadTask);
 loadTask();
@@ -368,11 +393,11 @@ function setOffline(why) {
 
 // 流式读取 SSE：每来一小段就把到目前为止的全文交给 onDelta，让回复逐字出现，
 // 学生不用对着空白等十几秒。
-async function askTutor(prompt, onDelta) {
+async function askTutor(system, messages, onDelta) {
   const r = await fetch(`${API_BASE}/api/tutor`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ prompt, stream: true })
+    body: JSON.stringify({ system, messages, stream: true })
   });
   if (!r.ok) {
     let msg = `The tutor couldn't answer (error ${r.status}).`;
@@ -403,23 +428,68 @@ async function askTutor(prompt, onDelta) {
   return full.trim();
 }
 
-// 发问 → 流式填进一个气泡 → 收尾（解锁下一级 hint / 记日志）
-async function runAsk(prompt, logId, onDone) {
+// 规则放 system 而不是混在学生的话里：混在一起时模型会把"不要直接给答案"
+// 当成可以商量的内容，学生一追问就把改好的那行代码交出来了。
+const taskSystem = () => `${TUTOR_RULES}\n\n${HINT_RULES[level]}`;
+const qaSystem = () => `${TUTOR_RULES}\n\n${QA_RULES[qaKind]}`;
+
+// 开场白：带上题目、代码和四个思考框
+function buildOpening() {
+  const t = TASKS[$("task").value];
+  const val = (id) => $(id).value.trim() || "(I didn't write anything yet)";
+  lastSentCode = $("code").value;
+  return `[TASK ${t.id}]
+
+Assignment:
+${t.assignment}
+
+My current code:
+\`\`\`python
+${$("code").value}
+\`\`\`
+
+My thinking so far:
+- What I expect it to print: ${val("expect")}
+- What it actually prints: ${val("got")}
+- My guess about why: ${val("guess")}
+- My question: ${val("q")}`;
+}
+
+// 追问：学生改过代码就把新版本一起带上，否则 tutor 看到的还是开场时那份
+function buildFollowUp(text) {
+  const code = $("code").value;
+  if (code === lastSentCode) return text;
+  lastSentCode = code;
+  return `${text}\n\nI changed my code, here it is now:\n\`\`\`python\n${code}\n\`\`\``;
+}
+
+// 发一轮 → 流式填进气泡 → 存进 transcript
+async function send(logId, system, userContent, onDone) {
+  const history = convo[logId];
+  history.push({ role: "user", content: userContent });
   const bubble = addMsg("tutor", "…", logId);
   setBusy(true);
   try {
-    const text = await askTutor(prompt, (sofar) => {
+    const text = await askTutor(system, history, (sofar) => {
       bubble.textContent = sofar;
       $(logId).scrollTop = $(logId).scrollHeight;
     });
     bubble.textContent = text;
-    onDone(text);
+    history.push({ role: "assistant", content: text });
+    if (onDone) onDone(text);
   } catch (err) {
+    history.pop();  // 这轮没成功，别留在历史里，否则下次带着半截对话去问
     bubble.remove();
     addMsg("system", err.message, logId);
   } finally {
     setBusy(false);
   }
+}
+
+// 有了第一轮回复，回复框才有意义
+function enableReply() {
+  $("reply").disabled = false;
+  $("reply-send").disabled = false;
 }
 
 $("ask").addEventListener("click", () => {
@@ -432,10 +502,35 @@ $("ask").addEventListener("click", () => {
   events.push({ t: Date.now(), type: "ask", task: TASKS[$("task").value].id, level,
     expect: $("expect").value.trim(), got: $("got").value.trim(), guess, question: $("q").value.trim() });
   const askedAt = level;
-  runAsk(buildPrompt(), "log", (text) => {
+  // 第一轮才发整个开场白；之后按追问处理，不然每次都把题目和代码重复一遍
+  const first = convo["log"].length === 0;
+  send("log", taskSystem(), first ? buildOpening() : buildFollowUp($("q").value.trim() || "Help me with this code."), (text) => {
     events.push({ t: Date.now(), type: "tutor_reply", level: askedAt, text });
     if (askedAt === maxUnlocked && maxUnlocked < 3) { maxUnlocked++; renderLadder(); }
+    enableReply();
   });
+});
+
+// ---- 接着聊：回复 tutor 的问题 ----
+function sendReply() {
+  const text = $("reply").value.trim();
+  if (!text) { $("reply").focus(); return; }
+  if (!API_BASE) { addMsg("system", "The tutor isn't connected."); return; }
+  addMsg("student", text);
+  events.push({ t: Date.now(), type: "student_reply", level, text });
+  $("reply").value = "";
+  send("log", taskSystem(), buildFollowUp(text), (reply) => {
+    events.push({ t: Date.now(), type: "tutor_reply", level, text: reply });
+  });
+}
+$("reply-send").addEventListener("click", sendReply);
+$("reply").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); sendReply(); }
+});
+
+$("reset").addEventListener("click", () => {
+  resetTaskChat();
+  events.push({ t: Date.now(), type: "reset", task: TASKS[$("task").value].id });
 });
 
 // ---- tutor 连不上时的兜底：复制粘贴 ----
@@ -486,14 +581,28 @@ $("qa-ask").addEventListener("click", async () => {
   addMsg("student", q + ($("qa-code").value.trim() ? "\n(+ code attached)" : "") + (think ? `\nI think: ${think}` : ""), "qa-log");
   events.push({ t: Date.now(), type: "qa_ask", kind: qaKind, question: q, think, hasCode: !!$("qa-code").value.trim() });
   const askedKind = qaKind;
-  const prompt = buildQaPrompt();
+  // 这里也是多轮的：问完一个问题可以直接接着追问，tutor 记得前面说过什么
+  const userContent = buildQaTurn();
   ["qa-q", "qa-think"].forEach((id) => ($(id).value = ""));
-  runAsk(prompt, "qa-log", (text) => {
+  send("qa-log", qaSystem(), userContent, (text) => {
     events.push({ t: Date.now(), type: "qa_reply", kind: askedKind, text });
   });
 });
 
+// 只在代码/错误信息是新的时候才附上，避免每轮重复贴同一段
+let lastSentQaCode = null;
+function buildQaTurn() {
+  const q = $("qa-q").value.trim();
+  const code = $("qa-code").value.trim();
+  const think = $("qa-think").value.trim();
+  const codeBlock = code && code !== lastSentQaCode ? `\n\nMy code or error message:\n\`\`\`\n${code}\n\`\`\`` : "";
+  if (code) lastSentQaCode = code;
+  return `${q}${codeBlock}${think ? `\n\nWhat I think so far: ${think}` : ""}`;
+}
+
 $("qa-clear").addEventListener("click", () => {
+  convo["qa-log"] = [];
+  lastSentQaCode = null;
   $("qa-log").innerHTML = '<p class="empty">Your questions and the tutor\'s answers show up here.</p>';
   ["qa-q", "qa-code", "qa-think"].forEach((id) => ($(id).value = ""));
 });
